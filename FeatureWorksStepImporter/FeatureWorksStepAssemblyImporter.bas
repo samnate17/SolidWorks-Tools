@@ -30,25 +30,15 @@ Option Explicit
 ' into - their components are skipped and reported. Extend
 ' ProcessOneComponent if you need that.
 '
-' Same FeatureWorks settings as FeatureWorksStepImporter.bas:
-'   Recognition mode = Automatic, Feature type = Standard features,
-'   everything available in that mode except Volume (Draft has no
-'   automatic-mode option at all, so it's never included either way).
+' Recognition is driven by RunFeatureWorksRecognition / the same verified
+' CallBack sequence used in FeatureWorksStepImporter.bas - see that file's
+' header comment for why the documented IFeatureWorksApp automation API is
+' not used. WHICH feature types get recognized (Standard features vs sheet
+' metal, which types, Volume on/off) is controlled by FeatureWorks's own
+' remembered PropertyManager settings, not by this macro - see README.
 '
 ' Entry point for a toolbar button: RunFeatureWorksOnStepAssembly
 ' ============================================================================
-
-' --- fwAutomaticRecognitionOptions_e (FeatureWorks type library) ---
-Private Const fwExtrudeOption      As Long = &H1
-Private Const fwVolume             As Long = &H2    ' EXCLUDED by request
-Private Const fwRevolve            As Long = &H4
-Private Const fwHoles              As Long = &H8
-Private Const fwChamfils           As Long = &H10
-Private Const fwRibs               As Long = &H20
-Private Const STANDARD_AUTO_OPTIONS As Long = fwExtrudeOption Or fwRevolve Or fwHoles Or fwChamfils Or fwRibs
-
-' --- fwFeatureCreationOptions_e ---
-Private Const fwAllowFailFeatureCreation As Integer = &H2
 
 ' ----------------------------------------------------------------------------
 ' Assign this Sub to a toolbar button (Tools > Customize).
@@ -94,9 +84,9 @@ Sub RunFeatureWorksOnStepAssembly()
 
     Select Case swModel.GetType
         Case swDocumentTypes_e.swDocASSEMBLY
-            report = ProcessStepAssembly(swApp, fwApp, swModel, outputFolder)
+            report = ProcessStepAssembly(swApp, swModel, outputFolder)
         Case swDocumentTypes_e.swDocPART
-            report = ProcessStepPart(swApp, fwApp, swModel, outputFolder)
+            report = ProcessStepPart(swApp, swModel, outputFolder)
         Case Else
             swApp.CloseDoc swModel.GetTitle
             report = "The STEP file didn't open as a part or an assembly - nothing to do."
@@ -107,31 +97,39 @@ Sub RunFeatureWorksOnStepAssembly()
 End Sub
 
 ' Single-part STEP: run FeatureWorks directly, save into the output folder.
-Private Function ProcessStepPart(swApp As SldWorks.SldWorks, fwApp As Object, swModel As SldWorks.ModelDoc2, outputFolder As String) As String
+Private Function ProcessStepPart(swApp As SldWorks.SldWorks, swModel As SldWorks.ModelDoc2, outputFolder As String) As String
 
-    Dim recognizedCount As Long
+    Dim recognized As Boolean
     Dim savePath As String
     Dim saveErrors As Long, saveWarnings As Long
     Dim baseName As String
     Dim dotPos As Long
+    Dim statusMsg As String
 
     baseName = swModel.GetTitle
     dotPos = InStrRev(baseName, ".")
     If dotPos > 0 Then baseName = Left$(baseName, dotPos - 1)
 
-    recognizedCount = RecognizeActiveDocFeatures(fwApp, swModel)
+    recognized = RunFeatureWorksRecognition(swApp, swModel)
+
+    If Not recognized Then
+        statusMsg = "no imported body feature found to recognize"
+    ElseIf HasImportedFeature(swModel) Then
+        statusMsg = "an Imported* feature still remains (partial/no recognition) - check manually"
+    Else
+        statusMsg = "recognized cleanly - no dumb imported body left"
+    End If
 
     savePath = outputFolder & "\" & baseName & ".SLDPRT"
     swModel.Extension.SaveAs savePath, 0, swSaveAsOptions_e.swSaveAsOptions_Silent, Nothing, saveErrors, saveWarnings
     swApp.CloseDoc swModel.GetTitle
 
-    ProcessStepPart = "Single part. Recognized " & recognizedCount & " feature(s)." & vbCrLf & _
-                       "Saved to: " & savePath
+    ProcessStepPart = "Single part: " & statusMsg & "." & vbCrLf & "Saved to: " & savePath
 End Function
 
 ' STEP assembly: externalize + recognize every top-level component in place,
 ' then rebuild/repair/save the assembly itself.
-Private Function ProcessStepAssembly(swApp As SldWorks.SldWorks, fwApp As Object, swModel As SldWorks.ModelDoc2, outputFolder As String) As String
+Private Function ProcessStepAssembly(swApp As SldWorks.SldWorks, swModel As SldWorks.ModelDoc2, outputFolder As String) As String
 
     Dim swAssy As SldWorks.AssemblyDoc
     Dim comps As Variant
@@ -139,8 +137,8 @@ Private Function ProcessStepAssembly(swApp As SldWorks.SldWorks, fwApp As Object
     Dim comp As SldWorks.Component2
     Dim usedNames As Collection
     Dim assyTitle As String
-    Dim processedParts As Long, skippedParts As Long, totalRecognized As Long
-    Dim thisCount As Long
+    Dim processedParts As Long, skippedParts As Long, cleanParts As Long
+    Dim thisClean As Boolean
     Dim swAssyActive As Object
     Dim actErrors As Long
     Dim mateReport As String
@@ -159,9 +157,9 @@ Private Function ProcessStepAssembly(swApp As SldWorks.SldWorks, fwApp As Object
     If Not IsEmpty(comps) Then
         For Each singleComp In comps
             Set comp = singleComp
-            If ProcessOneComponent(swApp, fwApp, comp, outputFolder, usedNames, thisCount) Then
+            If ProcessOneComponent(swApp, comp, outputFolder, usedNames, thisClean) Then
                 processedParts = processedParts + 1
-                totalRecognized = totalRecognized + thisCount
+                If thisClean Then cleanParts = cleanParts + 1
             Else
                 skippedParts = skippedParts + 1
             End If
@@ -184,26 +182,30 @@ Private Function ProcessStepAssembly(swApp As SldWorks.SldWorks, fwApp As Object
     swAssyActive.Extension.SaveAs assySavePath, 0, swSaveAsOptions_e.swSaveAsOptions_Silent, Nothing, saveErrors, saveWarnings
 
     ProcessStepAssembly = "Assembly processed." & vbCrLf & _
-        "Components recognized: " & processedParts & " (total features: " & totalRecognized & ")" & vbCrLf & _
+        "Components processed: " & processedParts & " (recognized cleanly: " & cleanParts & ")" & vbCrLf & _
         "Components skipped (sub-assemblies or unresolvable): " & skippedParts & vbCrLf & _
         mateReport & vbCrLf & _
         "Saved assembly to: " & assySavePath & vbCrLf & _
-        "Saved parts to: " & outputFolder
+        "Saved parts to: " & outputFolder & vbCrLf & _
+        "(A component counted as ""processed"" but not ""recognized cleanly"" still has an " & _
+        "Imported* feature in its tree - open it directly to check.)"
 End Function
 
 ' Externalizes one top-level component to its own SLDPRT in outputFolder and
 ' runs FeatureWorks on it in place. Returns False (and leaves the component
 ' untouched) for sub-assemblies or anything that can't be resolved.
-Private Function ProcessOneComponent(swApp As SldWorks.SldWorks, fwApp As Object, comp As SldWorks.Component2, _
-                                      outputFolder As String, usedNames As Collection, ByRef recognizedCount As Long) As Boolean
+' cleanRecognition is True only if no Imported* feature remains afterward.
+Private Function ProcessOneComponent(swApp As SldWorks.SldWorks, comp As SldWorks.Component2, _
+                                      outputFolder As String, usedNames As Collection, ByRef cleanRecognition As Boolean) As Boolean
 
     Dim compDoc As SldWorks.ModelDoc2
     Dim activeDoc As Object
     Dim outPath As String
     Dim saveErrors As Long, saveWarnings As Long
     Dim actErrors As Long
+    Dim recognized As Boolean
 
-    recognizedCount = 0
+    cleanRecognition = False
     ProcessOneComponent = False
 
     On Error Resume Next
@@ -223,27 +225,61 @@ Private Function ProcessOneComponent(swApp As SldWorks.SldWorks, fwApp As Object
     Set activeDoc = swApp.ActivateDoc3(compDoc.GetTitle, False, swRebuildOnActivation_e.swDontRebuildActiveDoc, actErrors)
     If activeDoc Is Nothing Then Exit Function
 
-    recognizedCount = RecognizeActiveDocFeatures(fwApp, activeDoc)
+    recognized = RunFeatureWorksRecognition(swApp, activeDoc)
+    cleanRecognition = recognized And Not HasImportedFeature(activeDoc)
 
     activeDoc.Save3 swSaveAsOptions_e.swSaveAsOptions_Silent, saveErrors, saveWarnings
 
     ProcessOneComponent = True
 End Function
 
-' Shared recognition step: runs on whatever SOLIDWORKS currently considers
-' the active document (FeatureWorks's automation methods take no document
-' argument at all, so the right doc must already be active before calling).
-Private Function RecognizeActiveDocFeatures(fwApp As Object, activeDoc As Object) As Long
+' Runs FeatureWorks on whatever SOLIDWORKS currently considers the active
+' document, using the exact callback sequence SOLIDWORKS's own macro
+' recorder captures for Insert > FeatureWorks > Recognize Features with
+' "Automatic" selected in the PropertyManager (see FeatureWorksStepImporter.bas
+' header comment - the documented IFeatureWorksApp automation API is
+' unreliable). Returns False only if there was no imported body feature to
+' select in the first place.
+Private Function RunFeatureWorksRecognition(swApp As Object, activeDoc As Object) As Boolean
 
-    Dim recognizedCount As Long
+    Dim feat As Object
+    Dim retval As Long
 
-    recognizedCount = fwApp.RecognizeFeatureAutomatic(STANDARD_AUTO_OPTIONS)
-    If recognizedCount > 0 Then
-        fwApp.CreateFeatures fwAllowFailFeatureCreation
+    Set feat = activeDoc.FirstFeature
+    If feat Is Nothing Then
+        RunFeatureWorksRecognition = False
+        Exit Function
     End If
-    activeDoc.EditRebuild3
+    feat.Select2 False, -1 ' select the imported body - required, regardless of mode
 
-    RecognizeActiveDocFeatures = recognizedCount
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutomaticFeatureRecognition 0")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetInteractiveFeatureRecognition 1")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "RecognizeFeatures")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutoDimOptions 0 0 0 0")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutoRelOptions 0")
+
+    activeDoc.ClearSelection2 True
+    activeDoc.ForceRebuild3 True
+
+    RunFeatureWorksRecognition = True
+End Function
+
+' True if any feature in the tree is still a dumb imported body
+' ("Imported1", "Imported2", ...) - i.e. recognition left something behind.
+Private Function HasImportedFeature(doc As Object) As Boolean
+
+    Dim feat As Object
+
+    Set feat = doc.FirstFeature
+    Do While Not feat Is Nothing
+        If Left$(feat.Name, 8) = "Imported" Then
+            HasImportedFeature = True
+            Exit Function
+        End If
+        Set feat = feat.GetNextFeature
+    Loop
+
+    HasImportedFeature = False
 End Function
 
 ' Best-effort mate repair. AssemblyDoc::AutoMateRepair only exists from

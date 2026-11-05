@@ -8,28 +8,73 @@ Two SOLIDWORKS VBA macros for automating STEP → native SOLIDWORKS conversion:
   *or* assembly) into a native SOLIDWORKS assembly with fully-recognized
   native parts, with an output folder you choose.
 
-Both run FeatureWorks feature recognition with the same settings:
+Both macros run FeatureWorks so the saved result shows real recognized
+features (`Extrude1`, `Hole1`, `Fillet1`, ...) instead of a single dumb
+`Imported1` body.
 
-- **Recognition mode:** Automatic (`RecognizeFeatureAutomatic`)
-- **Feature type:** Standard features only (not sheet metal)
-- **Auto-recognized types:** Extrude/boss/cut, Revolve, Holes, Fillets &
-  Chamfers, Ribs — i.e. everything available in automatic mode **except
-  Volume**. Draft isn't included either, but that's automatic for free:
-  FeatureWorks has no automatic-mode option for Draft at all — it's only
-  recognized interactively.
+## How recognition is actually driven (read this first)
 
-- **Recognition mode:** Automatic (`RecognizeFeatureAutomatic`)
-- **Feature type:** Standard features only (not sheet metal)
-- **Auto-recognized types:** Extrude/boss/cut, Revolve, Holes, Fillets &
-  Chamfers, Ribs — i.e. everything available in automatic mode **except
-  Volume**. Draft isn't included either, but that's automatic for free:
-  FeatureWorks has no automatic-mode option for Draft at all — it's only
-  recognized interactively.
+The "official" documented way to automate this —
+`IFeatureWorksApp::RecognizeFeatureAutomatic` + `CreateFeatures` — is a
+known dead end: it returns 0 recognized features for a lot of people even
+run exactly per SOLIDWORKS's own sample code. Multiple independent forum
+reports hit the exact same symptom this project hit during testing:
+([one](https://3dswym.3dexperience.3ds.com/question/solidworks-user-forum/hello-i-want-to-make-a-macro-for-automatic-feature-recognition-of-an-imported-model-and-create-the-features-under-the-tree-i-have-tried-the-below-codes-it-s-running-but-didn-t-get-any-feature_Yr2EVlLET-WtVu6-4K6IDA),
+[two](https://3dswym.3dexperience.3ds.com/question/solidworks-user-forum/need-c-example-of-how-use-recognizefeatureautomatic-with-api_KkmjBBw-SdKn5tLjFVli5A)).
+
+Both macros instead drive FeatureWorks through
+`ISldWorks::CallBack("fworks@FWPlaybackManager", 0, "<command>")` — an
+**undocumented** internal interface, but the exact sequence SOLIDWORKS's
+own macro recorder captures when you manually run **Insert > FeatureWorks >
+Recognize Features** with Automatic selected in the PropertyManager. This
+project's sequence was captured and verified working that way (selecting
+the imported body feature first is required, regardless of recognition
+mode — none of the official samples do this, which is almost certainly why
+they don't work for people):
+
+```vb
+feat.Select2 False, -1   ' the imported body feature - required
+swApp.CallBack "fworks@FWPlaybackManager", 0, "SetAutomaticFeatureRecognition 0"
+swApp.CallBack "fworks@FWPlaybackManager", 0, "SetInteractiveFeatureRecognition 1"
+swApp.CallBack "fworks@FWPlaybackManager", 0, "RecognizeFeatures"
+swApp.CallBack "fworks@FWPlaybackManager", 0, "SetAutoDimOptions 0 0 0 0"
+swApp.CallBack "fworks@FWPlaybackManager", 0, "SetAutoRelOptions 0"
+```
+
+Yes, the flag names look backwards (`SetAutomaticFeatureRecognition 0` /
+`SetInteractiveFeatureRecognition 1` for *Automatic* mode) — that's exactly
+what the recorder captured with Automatic selected in the UI, so it's used
+verbatim rather than "corrected" based on what the names seem to imply.
+
+### One-time manual setup — WHICH feature types get recognized
+
+Neither the documented API nor the `FWPlaybackManager` commands above
+include anything for choosing *which* feature types to recognize (Standard
+features vs. sheet metal, Extrude/Revolve/Holes/Fillets/Ribs individually,
+Volume on/off). That's because the FeatureWorks PropertyManager just
+**remembers its own settings** between runs, the same way most SOLIDWORKS
+PropertyManagers do — so there's nothing for a macro to set.
+
+**Before running either macro for real work**, do this once by hand:
+
+1. Open any STEP file.
+2. **Insert > FeatureWorks > Recognize Features**.
+3. In the PropertyManager, select **Automatic**, **Standard features**
+   (not sheet metal), and check/uncheck exactly the feature types you want
+   (uncheck **Volume** if you don't want volume-based recognition; Draft
+   isn't offered in Automatic mode at all, so there's nothing to uncheck
+   there).
+4. Click the green checkmark to finish.
+
+SOLIDWORKS keeps that configuration as the default for every later
+`RecognizeFeatures` call — including the ones these macros trigger — until
+you change it again by hand the same way.
 
 ## Prerequisites
 
 - FeatureWorks must be licensed and enabled: **Tools > Add-ins**, tick
   **Active** (and optionally **Start Up**) next to FeatureWorks.
+- Do the one-time manual setup above at least once.
 
 ## Install (both macros live in one macro project)
 
@@ -63,6 +108,12 @@ to the source STEP file** (same name, `.SLDPRT` extension), closes it, then
 asks if you want to do another. When you're done, click **No** and it shows
 a summary of how many files succeeded/failed.
 
+A file "succeeds" only if no `Imported*` feature remains in its tree
+afterward — if FeatureWorks only partially recognized the body, that file
+is reported as failed (with the save path) so you can open it and check
+what's still dumb geometry, rather than silently shipping a half-recognized
+part.
+
 A STEP file that imports as an assembly is skipped by this macro — use
 `RunFeatureWorksOnStepAssembly` for those.
 
@@ -94,8 +145,9 @@ Click the button, pick **one** STEP file (part or assembly), then pick an
      FeatureManager tree by hand for anything greyed-out or red.
   5. Saves the assembly into the output folder as `<name>.SLDASM`.
 
-A summary MsgBox reports how many components were recognized, how many were
-skipped, and the mate-repair result.
+A summary MsgBox reports how many components were processed, how many of
+those came out "clean" (no `Imported*` feature left — same success bar as
+the single-part macro), how many were skipped, and the mate-repair result.
 
 ### Known limitations / things to verify on your end
 
@@ -125,10 +177,15 @@ checking the first time you run it, ideally on a throwaway copy:
 
 ## Notes / assumptions (both macros)
 
-- The bitmask constants mirror SOLIDWORKS's `fwAutomaticRecognitionOptions_e`
-  and `fwFeatureCreationOptions_e` enums directly (hardcoded in both `.bas`
-  files, so neither macro needs a VBA type-library reference to FeatureWorks
-  to run on any machine). See the comments at the top of either file if you
-  want to add sheet-metal types (`fwBaseFlange`, `fwSketchedBend`,
-  `fwAutoEdgeFlange`, `fwAutoHemFlange`) back in, or re-include `fwVolume`.
+- Both macros assume the imported body's feature is literally the *first*
+  feature in a freshly-opened/freshly-externalized part (true for a dumb
+  solid nothing else has touched yet) and select it with
+  `FirstFeature.Select2` rather than matching on the name `"Imported1"` —
+  more robust across locales/renames. Multi-body imports (several
+  `ImportedN` features) only get the first one selected; extend
+  `RunFeatureWorksRecognition` if you need all bodies selected at once.
+- "Recognized cleanly" is judged purely by whether any feature named
+  `Imported*` remains — it doesn't verify which specific feature *types*
+  came out, since that's governed by the one-time manual setup above, not
+  by anything the macro controls or can inspect reliably.
 - Output overwrites an existing file of the same name without prompting.

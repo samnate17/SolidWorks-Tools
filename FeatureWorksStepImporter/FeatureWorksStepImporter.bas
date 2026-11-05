@@ -5,40 +5,27 @@ Option Explicit
 ' FeatureWorksStepImporter
 '
 ' Toolbar-button macro: pick one or more STEP files, import each one, and run
-' FeatureWorks on it with:
-'   Recognition mode = Automatic
-'   Feature type     = Standard features (not sheet metal)
-'   Auto-recognize    = everything available in that mode EXCEPT Volume
-'                        (Draft has no automatic-mode option at all, so it is
-'                        never included)
+' FeatureWorks on it so the saved .SLDPRT shows real recognized features
+' (Extrude1, Hole1, Fillet1, ...) instead of a single dumb "Imported1" body.
+'
+' IMPORTANT - how this actually drives FeatureWorks:
+' The documented automation API (IFeatureWorksApp::RecognizeFeatureAutomatic
+' + CreateFeatures) is well known to silently do nothing for a lot of people
+' - it returns 0 recognized features even run exactly per SOLIDWORKS's own
+' sample. This macro instead uses the sequence SOLIDWORKS's own macro
+' recorder captures when you manually run Insert > FeatureWorks > Recognize
+' Features with "Automatic" selected in the PropertyManager - an
+' undocumented but verified-working route via ISldWorks::CallBack into
+' "fworks@FWPlaybackManager". See RunFeatureWorksRecognition below.
+'
+' WHICH feature types get recognized (Standard features vs sheet metal,
+' which specific types, Volume on/off, Draft never) is controlled by
+' FeatureWorks's OWN remembered PropertyManager settings - not by this
+' macro, because there's no verified way to set that from code. Do a
+' one-time manual run first to lock in the settings you want. See README.
 '
 ' Entry point for a toolbar button: RunFeatureWorksOnStepFiles
 ' ============================================================================
-
-' --- fwAutomaticRecognitionOptions_e (FeatureWorks type library) ---
-' https://help.solidworks.com/.../fwAutomaticRecognitionOptions_e.html
-Private Const fwExtrudeOption      As Long = &H1    ' extrude/boss/cut - Standard
-Private Const fwVolume             As Long = &H2    ' volume features  - EXCLUDED by request
-Private Const fwRevolve            As Long = &H4    ' Standard
-Private Const fwHoles              As Long = &H8    ' Standard
-Private Const fwChamfils           As Long = &H10   ' fillets & chamfers - Standard
-Private Const fwRibs               As Long = &H20   ' Standard
-Private Const fwBaseFlange         As Long = &H40   ' Sheet Metal - not "Standard features"
-Private Const fwSketchedBend       As Long = &H80   ' Sheet Metal
-Private Const fwAutoEdgeFlange     As Long = &H100  ' Sheet Metal
-Private Const fwAutoHemFlange      As Long = &H200  ' Sheet Metal
-
-' All "Standard features" automatic-recognition bits except Volume.
-' (There is no automatic-mode bit for Draft - FeatureWorks only recognizes
-' draft features interactively - so "except ... drafts" is satisfied for free.)
-Private Const STANDARD_AUTO_OPTIONS As Long = fwExtrudeOption Or fwRevolve Or fwHoles Or fwChamfils Or fwRibs
-
-' --- fwFeatureCreationOptions_e ---
-' https://help.solidworks.com/.../fwFeatureCreationOptions_e.html
-Private Const fwAllowFailFeatureCreation As Integer = &H2
-
-' --- swDocumentTypes_e.swDocPART (standard SOLIDWORKS constant) ---
-Private Const SW_DOC_PART As Long = 1
 
 ' ----------------------------------------------------------------------------
 ' Assign this Sub to a toolbar button:
@@ -61,6 +48,7 @@ Sub RunFeatureWorksOnStepFiles()
 
     Set swApp = Application.SldWorks
 
+    ' Sanity check only - actual recognition below doesn't go through fwApp.
     Set fwApp = swApp.GetAddInObject("FeatureWorks.FeatureWorksApp")
     If fwApp Is Nothing Then
         MsgBox "The FeatureWorks add-in is not active." & vbCrLf & _
@@ -77,7 +65,7 @@ Sub RunFeatureWorksOnStepFiles()
 
         If Len(stepPath) = 0 Then Exit Do ' user cancelled the picker
 
-        resultMsg = ImportAndRecognizeStep(swApp, fwApp, stepPath)
+        resultMsg = ImportAndRecognizeStep(swApp, stepPath)
         If Len(resultMsg) = 0 Then
             okCount = okCount + 1
         Else
@@ -97,15 +85,13 @@ Sub RunFeatureWorksOnStepFiles()
 End Sub
 
 ' Imports one STEP file and runs FeatureWorks on it.
-' Returns "" on success, or an error description on failure.
-Private Function ImportAndRecognizeStep(swApp As SldWorks.SldWorks, fwApp As Object, stepPath As String) As String
+' Returns "" on success, or an error/warning description on failure.
+Private Function ImportAndRecognizeStep(swApp As SldWorks.SldWorks, stepPath As String) As String
 
     Dim swImportStepData As SldWorks.ImportStepData
     Dim swModel As SldWorks.ModelDoc2
     Dim swModelDocExt As SldWorks.ModelDocExtension
     Dim loadErrors As Long
-    Dim recognizedCount As Long
-    Dim created As Boolean
     Dim docTitle As String
     Dim savePath As String
     Dim saveErrors As Long, saveWarnings As Long
@@ -124,7 +110,7 @@ Private Function ImportAndRecognizeStep(swApp As SldWorks.SldWorks, fwApp As Obj
 
     docTitle = swModel.GetTitle
 
-    If swModel.GetType <> SW_DOC_PART Then
+    If swModel.GetType <> swDocumentTypes_e.swDocPART Then
         swApp.CloseDoc docTitle
         ImportAndRecognizeStep = "Skipped (not a single-body part): " & stepPath
         Exit Function
@@ -132,13 +118,11 @@ Private Function ImportAndRecognizeStep(swApp As SldWorks.SldWorks, fwApp As Obj
 
     Set swModelDocExt = swModel.Extension
 
-    recognizedCount = fwApp.RecognizeFeatureAutomatic(STANDARD_AUTO_OPTIONS)
-
-    If recognizedCount > 0 Then
-        created = fwApp.CreateFeatures(fwAllowFailFeatureCreation)
+    If Not RunFeatureWorksRecognition(swApp, swModel) Then
+        swApp.CloseDoc docTitle
+        ImportAndRecognizeStep = "Skipped (no imported body feature found to recognize): " & stepPath
+        Exit Function
     End If
-
-    swModel.EditRebuild3
 
     dotPos = InStrRev(stepPath, ".")
     If dotPos > 0 Then
@@ -149,17 +133,71 @@ Private Function ImportAndRecognizeStep(swApp As SldWorks.SldWorks, fwApp As Obj
 
     swModelDocExt.SaveAs savePath, 0, swSaveAsOptions_e.swSaveAsOptions_Silent, Nothing, saveErrors, saveWarnings
 
-    swApp.CloseDoc docTitle
-
     If saveErrors <> 0 Then
-        ImportAndRecognizeStep = "Recognized " & recognizedCount & " feature(s) but failed to save: " & savePath
-    Else
-        ImportAndRecognizeStep = "" ' success
+        swApp.CloseDoc docTitle
+        ImportAndRecognizeStep = "Recognition ran but failed to save: " & savePath
+        Exit Function
     End If
+
+    If HasImportedFeature(swModel) Then
+        swApp.CloseDoc docTitle
+        ImportAndRecognizeStep = "Saved, but an Imported* feature still remains in the tree " & _
+                                  "(partial or no recognition) - check manually: " & savePath
+        Exit Function
+    End If
+
+    swApp.CloseDoc docTitle
+    ImportAndRecognizeStep = "" ' success - no dumb imported body left in the tree
 
     Exit Function
 
 HandleError:
     ImportAndRecognizeStep = "Error on " & stepPath & ": " & Err.Description
 
+End Function
+
+' Runs FeatureWorks on whatever SOLIDWORKS currently considers the active
+' document, using the verified callback sequence described at the top of
+' this file. Returns False only if there was no imported body feature to
+' select in the first place (nothing to recognize).
+Private Function RunFeatureWorksRecognition(swApp As Object, activeDoc As Object) As Boolean
+
+    Dim feat As Object
+    Dim retval As Long
+
+    Set feat = activeDoc.FirstFeature
+    If feat Is Nothing Then
+        RunFeatureWorksRecognition = False
+        Exit Function
+    End If
+    feat.Select2 False, -1 ' select the imported body - required, regardless of mode
+
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutomaticFeatureRecognition 0")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetInteractiveFeatureRecognition 1")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "RecognizeFeatures")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutoDimOptions 0 0 0 0")
+    retval = swApp.CallBack("fworks@FWPlaybackManager", 0, "SetAutoRelOptions 0")
+
+    activeDoc.ClearSelection2 True
+    activeDoc.ForceRebuild3 True
+
+    RunFeatureWorksRecognition = True
+End Function
+
+' True if any feature in the tree is still a dumb imported body
+' ("Imported1", "Imported2", ...) - i.e. recognition left something behind.
+Private Function HasImportedFeature(doc As Object) As Boolean
+
+    Dim feat As Object
+
+    Set feat = doc.FirstFeature
+    Do While Not feat Is Nothing
+        If Left$(feat.Name, 8) = "Imported" Then
+            HasImportedFeature = True
+            Exit Function
+        End If
+        Set feat = feat.GetNextFeature
+    Loop
+
+    HasImportedFeature = False
 End Function
